@@ -733,6 +733,47 @@ async fn target_url_without_nonempty_host_returns_422() {
 }
 
 #[tokio::test]
+async fn target_url_with_delimiter_later_in_path_returns_422() {
+    let (client, base, _, dir) = start().await;
+    let invalid_urls = [
+        "http:/example.com://x",
+        "http:/example.com//x",
+        "http:example.com://x",
+        "https:/example.com://x",
+        "http:/a/b://c",
+    ];
+    for (i, url) in invalid_urls.iter().enumerate() {
+        let (status, body) =
+            enqueue(&client, &base, &format!("md{i}"), url, &json!({"a": 1})).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "url {url:?}"
+        );
+        assert_eq!(error_code(&body), "invalid_target_url", "url {url:?}");
+    }
+    drop(dir);
+}
+
+#[tokio::test]
+async fn target_url_with_slashes_later_in_path_returns_201() {
+    let (client, base, _, dir) = start().await;
+    let valid_urls = [
+        "https://example.test/a://b",
+        "http://[::1]:8080/p",
+        "http://user:pass@example.test/p",
+    ];
+    for (i, url) in valid_urls.iter().copied().enumerate() {
+        let (status, body) =
+            enqueue(&client, &base, &format!("mv{i}"), url, &json!({"a": 1})).await;
+        assert_eq!(status, reqwest::StatusCode::CREATED, "url {url:?}");
+        assert_eq!(s(&body, "target_url"), url, "url {url:?}");
+        assert_eq!(s(&body, "status"), "pending", "url {url:?}");
+    }
+    drop(dir);
+}
+
+#[tokio::test]
 async fn missing_target_url_returns_422() {
     let (client, base, _, _) = start().await;
     let (status, body) = enqueue_raw(&client, &base, Some("k"), r#"{"payload":{"a":1}}"#).await;

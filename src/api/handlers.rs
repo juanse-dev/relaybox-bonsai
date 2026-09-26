@@ -76,9 +76,13 @@ fn err(e: ApiError) -> (StatusCode, Json<Value>) {
     (status, Json(body))
 }
 
-fn has_nonempty_host(raw: &str) -> bool {
-    let rest = match raw.find("://") {
-        Some(i) => &raw[i + 3..],
+fn has_nonempty_host(raw: &str, scheme_len: usize) -> bool {
+    let after_scheme = match raw.get(scheme_len..) {
+        Some(after_scheme) => after_scheme,
+        None => return false,
+    };
+    let rest = match after_scheme.strip_prefix("://") {
+        Some(rest) => rest,
         None => return false,
     };
     let mut authority_end = rest.len();
@@ -156,7 +160,7 @@ pub async fn enqueue(
         Err(_) => return err(ApiError::InvalidTargetUrl),
     };
     let scheme_ok = parsed_url.scheme() == "http" || parsed_url.scheme() == "https";
-    let host_ok = has_nonempty_host(&target_url);
+    let host_ok = has_nonempty_host(&target_url, parsed_url.scheme().len());
     if !scheme_ok || !host_ok {
         return err(ApiError::InvalidTargetUrl);
     }
