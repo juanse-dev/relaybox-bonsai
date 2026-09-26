@@ -10,6 +10,37 @@ use crate::api::errors::ApiError;
 use crate::api::state::AppState;
 use crate::domain::delivery::{Delivery, EnqueueOutcome};
 
+fn hex_to_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_segment(segment: &str) -> Option<Vec<u8>> {
+    let bytes = segment.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_to_val(bytes[i + 1])?;
+            let lo = hex_to_val(bytes[i + 2])?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
 pub async fn health() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
 }
@@ -108,7 +139,10 @@ where
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, ApiError> {
         let raw_segment = req.uri().path().split('/').next_back().unwrap_or("");
-        let id = raw_segment
+        let decoded_bytes =
+            percent_decode_segment(raw_segment).ok_or(ApiError::DeliveryNotFound)?;
+        let decoded = String::from_utf8(decoded_bytes).map_err(|_| ApiError::DeliveryNotFound)?;
+        let id = decoded
             .parse::<Uuid>()
             .map_err(|_| ApiError::DeliveryNotFound)?;
         Ok(Self(id))

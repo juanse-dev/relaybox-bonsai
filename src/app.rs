@@ -33,6 +33,7 @@ impl App {
                 axum::routing::get(crate::api::handlers::get_delivery),
             )
             .route("/health", axum::routing::get(crate::api::handlers::health))
+            .layer(axum::extract::DefaultBodyLimit::disable())
             .with_state(state);
 
         Ok(Self { router })

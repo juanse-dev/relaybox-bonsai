@@ -583,3 +583,37 @@ async fn missing_payload_returns_422() {
     assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(error_code(&body), "invalid_payload");
 }
+
+#[tokio::test]
+async fn uri_percent_encoded_uuid_returns_200() {
+    let (client, base, _, dir) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "enc-k",
+        "https://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let id = body.get("id").unwrap().as_str().unwrap().to_string();
+    let last = id.as_bytes().last().unwrap();
+    let encoded = format!("{}%{:02X}", &id[..id.len() - 1], last);
+    let (status2, body2) = get(&client, &base, &format!("/v1/deliveries/{encoded}")).await;
+    assert_eq!(status2, reqwest::StatusCode::OK);
+    assert_eq!(s(&body2, "id"), id.as_str());
+    drop(dir);
+}
+
+#[tokio::test]
+async fn large_payload_over_default_limit_is_accepted() {
+    let (client, base, _, dir) = start().await;
+    let big = "a".repeat(3_200_000);
+    let body = format!(
+        r#"{{"target_url":"https://example.test/webhooks","payload":"{}"}}"#,
+        big
+    );
+    let (status, _) = enqueue_raw(&client, &base, Some("large-k"), &body).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    drop(dir);
+}

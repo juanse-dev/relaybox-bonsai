@@ -2,8 +2,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 
 use crate::application::errors::RepositoryError;
-use crate::application::ports::DeliveryRepository;
-use crate::domain::delivery::{Delivery, EnqueueOutcome, Status};
+use crate::application::ports::{DeliveryRepository, EnqueueInsertResult};
+use crate::domain::delivery::{Delivery, Status};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -84,31 +84,18 @@ fn row_to_delivery(row: &SqliteRow) -> Result<Delivery, RepositoryError> {
     })
 }
 
-/// Does an existing row conflict with a new enqueue? A conflict means the same
-/// `idempotency_key` was reused with *different* content (different target URL
-/// or payload), which the spec rejects with `409 idempotency_conflict`.
-fn is_conflict_row(row: &SqliteRow, target_url: &str, payload: &Value) -> bool {
-    if row.get::<String, _>("target_url") != target_url {
-        return true;
-    }
-    match serde_json::from_str::<Value>(&row.get::<String, _>("payload")) {
-        Ok(v) => v != *payload,
-        Err(_) => true,
-    }
-}
-
 #[async_trait]
 impl DeliveryRepository for SqliteDeliveryRepository {
     async fn enqueue(
         &self,
         idempotency_key: &str,
         target_url: &str,
-        payload: Value,
-    ) -> Result<EnqueueOutcome, RepositoryError> {
+        payload: &Value,
+    ) -> Result<EnqueueInsertResult, RepositoryError> {
         let id = Uuid::new_v4();
         let now = Utc::now();
 
-        let payload_json = serde_json::to_string(&payload)
+        let payload_json = serde_json::to_string(payload)
             .map_err(|e| RepositoryError::Db(format!("serialize payload: {e}")))?;
 
         let mut conn = self
@@ -120,7 +107,7 @@ impl DeliveryRepository for SqliteDeliveryRepository {
         let result = sqlx::query(
             "INSERT INTO deliveries
                  (id, idempotency_key, target_url, payload, status, attempts, created_at)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(id.to_string())
         .bind(idempotency_key)
@@ -133,12 +120,12 @@ impl DeliveryRepository for SqliteDeliveryRepository {
         .await;
 
         match result {
-            Ok(_) => Ok(EnqueueOutcome::Created(Delivery {
+            Ok(_) => Ok(EnqueueInsertResult::Inserted(Delivery {
                 id,
                 status: Status::Pending,
                 attempts: 0,
                 target_url: target_url.to_string(),
-                payload,
+                payload: payload.clone(),
                 created_at: now,
             })),
             Err(e) => {
@@ -146,8 +133,7 @@ impl DeliveryRepository for SqliteDeliveryRepository {
                     return Err(RepositoryError::Db(format!("insert failed: {e}")));
                 }
                 // The winner of the idempotency race has already committed, so
-                // the existing row is now visible (READ COMMITTED). Re-read it
-                // and decide replay vs. conflict.
+                // the existing row is now visible (READ COMMITTED). Re-read it.
                 let row = sqlx::query(
                     "SELECT id, status, attempts, target_url, payload, created_at
                      FROM deliveries
@@ -158,11 +144,7 @@ impl DeliveryRepository for SqliteDeliveryRepository {
                 .await
                 .map_err(|e| RepositoryError::Db(format!("fetch existing row: {e}")))?;
 
-                if is_conflict_row(&row, target_url, &payload) {
-                    Ok(EnqueueOutcome::Conflict)
-                } else {
-                    Ok(EnqueueOutcome::Replayed(row_to_delivery(&row)?))
-                }
+                Ok(EnqueueInsertResult::AlreadyExists(row_to_delivery(&row)?))
             }
         }
     }
