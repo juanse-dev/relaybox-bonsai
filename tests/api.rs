@@ -118,6 +118,39 @@ async fn enqueue_raw(
     (status, value)
 }
 
+/// Enqueue with an idempotency key supplied as raw bytes.
+///
+/// Unlike `enqueue_raw`, the key is not required to be UTF-8. This lets the
+/// suite exercise the lossless handling of non-UTF-8 key bytes.
+async fn enqueue_bytes(
+    client: &Client,
+    base: &str,
+    key: Option<&[u8]>,
+    body: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let resp = match key {
+        Some(k) => {
+            client
+                .post(format!("{base}/v1/deliveries"))
+                .header("idempotency-key", k)
+                .body(body.as_bytes().to_vec())
+                .send()
+                .await
+        }
+        None => {
+            client
+                .post(format!("{base}/v1/deliveries"))
+                .body(body.as_bytes().to_vec())
+                .send()
+                .await
+        }
+    }
+    .unwrap();
+    let status = resp.status();
+    let value: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+    (status, value)
+}
+
 #[tokio::test]
 async fn health_returns_ok() {
     let (client, base, _, _) = start().await;
@@ -580,6 +613,36 @@ async fn idempotency_key_normalizes_surrounding_ascii_whitespace() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn non_utf8_idempotency_key_is_accepted_and_replayed() {
+    let (client, base, _, dir) = start().await;
+    let body = r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#;
+    // "foo\x80bar": 0x80 is a legal header byte but is not valid UTF-8.
+    let key = [0x66, 0x6f, 0x6f, 0x80, 0x62, 0x61, 0x72];
+    let (status, _) = enqueue_bytes(&client, &base, Some(&key), body).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+
+    // A replay with the same raw bytes is stable.
+    let (status, _) = enqueue_bytes(&client, &base, Some(&key), body).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn non_utf8_keys_distinct_when_bytes_differ() {
+    let (client, base, _, dir) = start().await;
+    let body = r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#;
+    // Two keys that differ by a single non-UTF-8 byte must remain distinct;
+    // this proves the key bytes are preserved losslessly, not collapsed.
+    let key_a = [0x66, 0x6f, 0x6f, 0x80, 0x62, 0x61, 0x72];
+    let key_b = [0x66, 0x6f, 0x6f, 0x81, 0x62, 0x61, 0x72];
+    let (status, _) = enqueue_bytes(&client, &base, Some(&key_a), body).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let (status, _) = enqueue_bytes(&client, &base, Some(&key_b), body).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
     drop(dir);
 }
 
