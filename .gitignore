@@ -1,0 +1,3 @@
+target/
+relaybox.db
+.env
