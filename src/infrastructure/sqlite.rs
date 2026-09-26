@@ -36,6 +36,7 @@ pub async fn open_pool(db_url: &str) -> anyhow::Result<Pool<Sqlite>> {
     let opts: SqliteConnectOptions = db_url
         .parse::<SqliteConnectOptions>()
         .with_context(|| format!("invalid sqlite url {db_url:?}"))?
+        .create_if_missing(true)
         .busy_timeout(Duration::from_secs(15));
 
     sqlx::Pool::connect_with(opts)

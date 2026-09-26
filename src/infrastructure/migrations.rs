@@ -58,7 +58,6 @@ mod tests {
     async fn run_migrations_applies_and_is_idempotent() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        std::fs::write(&db_path, b"").unwrap();
         let db_url = format!("sqlite://{}", db_path.display());
 
         let pool = crate::infrastructure::sqlite::open_pool(&db_url)
