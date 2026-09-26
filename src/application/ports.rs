@@ -2,13 +2,25 @@ use async_trait::async_trait;
 
 use crate::application::errors::RepositoryError;
 use crate::domain::delivery::Delivery;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use uuid::Uuid;
+
+/// Metadata for a freshly inserted delivery.
+///
+/// The repository persists the serialized payload but does not hand back the
+/// owned JSON tree (that would force a clone). The service moves its owned
+/// `payload` into the `Delivery` it builds.
+#[derive(Debug, Clone)]
+pub struct InsertedDelivery {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+}
 
 /// The raw result of the atomic "insert or report existing" operation.
 #[derive(Debug, Clone)]
 pub enum EnqueueInsertResult {
-    Inserted(Delivery),
+    Inserted(InsertedDelivery),
     AlreadyExists(Delivery),
 }
 

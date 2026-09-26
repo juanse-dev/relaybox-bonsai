@@ -2,7 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 
 use crate::application::errors::RepositoryError;
-use crate::application::ports::{DeliveryRepository, EnqueueInsertResult};
+use crate::application::ports::{DeliveryRepository, EnqueueInsertResult, InsertedDelivery};
 use crate::domain::delivery::{Delivery, Status};
 
 use chrono::{DateTime, Utc};
@@ -120,12 +120,8 @@ impl DeliveryRepository for SqliteDeliveryRepository {
         .await;
 
         match result {
-            Ok(_) => Ok(EnqueueInsertResult::Inserted(Delivery {
+            Ok(_) => Ok(EnqueueInsertResult::Inserted(InsertedDelivery {
                 id,
-                status: Status::Pending,
-                attempts: 0,
-                target_url: target_url.to_string(),
-                payload: payload.clone(),
                 created_at: now,
             })),
             Err(e) => {

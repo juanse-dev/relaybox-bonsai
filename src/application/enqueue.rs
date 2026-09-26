@@ -1,6 +1,6 @@
 use crate::application::errors::ApplicationError;
 use crate::application::ports::{DeliveryRepository, EnqueueInsertResult};
-use crate::domain::delivery::EnqueueOutcome;
+use crate::domain::delivery::{Delivery, EnqueueOutcome, Status};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -25,7 +25,14 @@ impl EnqueueService {
             .await?;
 
         Ok(match insert {
-            EnqueueInsertResult::Inserted(delivery) => EnqueueOutcome::Created(delivery),
+            EnqueueInsertResult::Inserted(meta) => EnqueueOutcome::Created(Delivery {
+                id: meta.id,
+                status: Status::Pending,
+                attempts: 0,
+                target_url: target_url.to_string(),
+                payload,
+                created_at: meta.created_at,
+            }),
             EnqueueInsertResult::AlreadyExists(existing) => {
                 if existing.target_url == target_url && existing.payload == payload {
                     EnqueueOutcome::Replayed(existing)
@@ -41,7 +48,7 @@ impl EnqueueService {
 mod tests {
     use super::EnqueueService;
     use crate::application::errors::RepositoryError;
-    use crate::application::ports::{DeliveryRepository, EnqueueInsertResult};
+    use crate::application::ports::{DeliveryRepository, EnqueueInsertResult, InsertedDelivery};
     use crate::domain::delivery::{Delivery, EnqueueOutcome, Status};
     use async_trait::async_trait;
     use chrono::Utc;
@@ -90,14 +97,19 @@ mod tests {
     async fn inserted_maps_to_created() {
         let d = delivery("https://a.test/x", json!({"a": 1}));
         let outcome = run(
-            EnqueueInsertResult::Inserted(d.clone()),
+            EnqueueInsertResult::Inserted(InsertedDelivery {
+                id: d.id,
+                created_at: d.created_at,
+            }),
             "https://a.test/x",
             json!({"a": 1}),
         )
         .await;
         match &outcome {
             EnqueueOutcome::Created(delivery) => {
-                assert_eq!(delivery.target_url, "https://a.test/x")
+                assert_eq!(delivery.id, d.id);
+                assert_eq!(delivery.target_url, "https://a.test/x");
+                assert_eq!(delivery.payload, json!({"a": 1}));
             }
             other => panic!("expected Created, got {other:?}"),
         }
