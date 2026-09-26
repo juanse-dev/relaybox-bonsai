@@ -120,7 +120,7 @@ impl DeliveryRepository for SqliteDeliveryRepository {
         let result = sqlx::query(
             "INSERT INTO deliveries
                  (id, idempotency_key, target_url, payload, status, attempts, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(id.to_string())
         .bind(idempotency_key)

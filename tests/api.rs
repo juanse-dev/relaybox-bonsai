@@ -128,7 +128,7 @@ async fn health_returns_ok() {
 
 #[tokio::test]
 async fn new_enqueue_returns_201_with_representation() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (status, body) = enqueue(
         &client,
         &base,
@@ -147,11 +147,12 @@ async fn new_enqueue_returns_201_with_representation() {
         &json!({"event": "invoice.created", "invoice_id": "inv_123"})
     );
     assert!(body.get("created_at").is_some());
+    drop(dir);
 }
 
 #[tokio::test]
 async fn target_url_stored_verbatim() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (status, body) = enqueue(
         &client,
         &base,
@@ -166,11 +167,12 @@ async fn target_url_stored_verbatim() {
     assert_eq!(status2, reqwest::StatusCode::OK);
     assert_eq!(s(&body2, "target_url"), "https://a.test/webhooks/?b=2&a=1");
     assert_eq!(value_of(&body2, "payload"), &json!({"a": 1}));
+    drop(dir);
 }
 
 #[tokio::test]
 async fn payload_accepts_various_json_types() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let payloads = [
         json!("hello"),
         json!(42),
@@ -191,12 +193,13 @@ async fn payload_accepts_various_json_types() {
         assert_eq!(status, reqwest::StatusCode::CREATED);
         assert_eq!(value_of(&body, "payload"), p);
     }
+    drop(dir);
 }
 
 #[tokio::test]
 async fn large_integer_payload_round_trips() {
     let big: u128 = 123456789012345678901234567890;
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (status, body) = enqueue(
         &client,
         &base,
@@ -211,11 +214,12 @@ async fn large_integer_payload_round_trips() {
     let (status2, body2) = get(&client, &base, &format!("/v1/deliveries/{id}")).await;
     assert_eq!(status2, reqwest::StatusCode::OK);
     assert_eq!(value_of(&body2, "payload"), &json!({"n": big}));
+    drop(dir);
 }
 
 #[tokio::test]
 async fn get_existing_returns_200_and_fields() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (status, body) = enqueue(
         &client,
         &base,
@@ -234,6 +238,7 @@ async fn get_existing_returns_200_and_fields() {
     assert_eq!(s(&body2, "target_url"), "https://example.test/webhooks");
     assert_eq!(value_of(&body2, "payload"), &json!({"a": 1}));
     assert!(body2.get("created_at").is_some());
+    drop(dir);
 }
 
 #[tokio::test]
@@ -267,7 +272,7 @@ async fn uri_percent_encoded_non_uuid_returns_404() {
 
 #[tokio::test]
 async fn replay_same_content_returns_200_same_id() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (s1, b1) = enqueue(
         &client,
         &base,
@@ -288,11 +293,12 @@ async fn replay_same_content_returns_200_same_id() {
     .await;
     assert_eq!(s2, reqwest::StatusCode::OK);
     assert_eq!(s(&b2, "id"), id1.as_str());
+    drop(dir);
 }
 
 #[tokio::test]
 async fn replay_payload_key_order_insensitive() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (s1, b1) = enqueue(
         &client,
         &base,
@@ -313,11 +319,12 @@ async fn replay_payload_key_order_insensitive() {
     .await;
     assert_eq!(s2, reqwest::StatusCode::OK);
     assert_eq!(s(&b2, "id"), id1.as_str());
+    drop(dir);
 }
 
 #[tokio::test]
 async fn conflict_different_url_returns_409() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     enqueue(
         &client,
         &base,
@@ -336,11 +343,12 @@ async fn conflict_different_url_returns_409() {
     .await;
     assert_eq!(status, reqwest::StatusCode::CONFLICT);
     assert_eq!(error_code(&body), "idempotency_conflict");
+    drop(dir);
 }
 
 #[tokio::test]
 async fn conflict_different_payload_returns_409() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     enqueue(
         &client,
         &base,
@@ -359,11 +367,12 @@ async fn conflict_different_payload_returns_409() {
     .await;
     assert_eq!(status, reqwest::StatusCode::CONFLICT);
     assert_eq!(error_code(&body), "idempotency_conflict");
+    drop(dir);
 }
 
 #[tokio::test]
 async fn conflict_leaves_original_unchanged() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let (s1, b1) = enqueue(
         &client,
         &base,
@@ -386,11 +395,12 @@ async fn conflict_leaves_original_unchanged() {
     assert_eq!(status2, reqwest::StatusCode::OK);
     assert_eq!(s(&body2, "target_url"), "https://a.test/webhooks");
     assert_eq!(value_of(&body2, "payload"), &json!({"a": 1}));
+    drop(dir);
 }
 
 #[tokio::test]
 async fn concurrent_same_key_single_row() {
-    let (client, base, db_url, _) = start().await;
+    let (client, base, db_url, dir) = start().await;
     let key = "concurrent-key";
     let url = "https://example.test/webhooks";
     let payload = json!({"event": "x"});
@@ -418,6 +428,7 @@ async fn concurrent_same_key_single_row() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+    drop(dir);
 }
 
 #[tokio::test]
@@ -507,7 +518,7 @@ async fn long_idempotency_key_returns_400() {
 
 #[tokio::test]
 async fn boundary_idempotency_key_of_128_bytes_is_accepted() {
-    let (client, base, _, _) = start().await;
+    let (client, base, _, dir) = start().await;
     let key = "a".repeat(128);
     let (status, _) = enqueue_raw(
         &client,
@@ -517,6 +528,7 @@ async fn boundary_idempotency_key_of_128_bytes_is_accepted() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::CREATED);
+    drop(dir);
 }
 
 #[tokio::test]

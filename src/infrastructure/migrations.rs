@@ -9,9 +9,9 @@ use sqlx::{Pool, Row};
 pub async fn run_migrations(pool: &Pool<Sqlite>) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\n\
-             sql_version TEXT PRIMARY KEY,\n\
-             applied_at TIMESTAMP NOT NULL\n\
-         )",
+              sql_version TEXT PRIMARY KEY,\n\
+              applied_at TIMESTAMP NOT NULL\n\
+          )",
     )
     .execute(pool)
     .await?;
