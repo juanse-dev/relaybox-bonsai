@@ -532,6 +532,58 @@ async fn boundary_idempotency_key_of_128_bytes_is_accepted() {
 }
 
 #[tokio::test]
+async fn tab_containing_idempotency_key_is_accepted() {
+    let (client, base, _, dir) = start().await;
+    let key = "foo\tbar";
+    // A legal Idempotency-Key may embed a horizontal tab; the first use
+    // must create a delivery rather than be treated as a missing header.
+    let (status, _) = enqueue_raw(
+        &client,
+        &base,
+        Some(key),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+
+    // A replay with the same tab-containing key is stable.
+    let (status, _) = enqueue_raw(
+        &client,
+        &base,
+        Some(key),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    drop(dir);
+}
+
+#[tokio::test]
+async fn idempotency_key_normalizes_surrounding_ascii_whitespace() {
+    let (client, base, _, dir) = start().await;
+    // Surrounding (space + tab) ASCII whitespace is trimmed; "  \tfoo\t  " -> "foo".
+    let (status, _) = enqueue_raw(
+        &client,
+        &base,
+        Some("  \tfoo\t  "),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+
+    // A differently whitespace-padded key with the same trimmed value replays.
+    let (status, _) = enqueue_raw(
+        &client,
+        &base,
+        Some(" foo "),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    drop(dir);
+}
+
+#[tokio::test]
 async fn malformed_json_returns_400() {
     let (client, base, _, _) = start().await;
     let (status, body) = enqueue_raw(&client, &base, Some("k"), r#"{not json"#).await;

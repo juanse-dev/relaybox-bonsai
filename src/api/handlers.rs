@@ -66,18 +66,20 @@ pub async fn enqueue(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<Value>) {
-    let key = match headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(raw) if !raw.trim().is_empty() => {
-            let trimmed = raw.trim().to_string();
+    let key = match headers.get("idempotency-key").map(|value| value.as_bytes()) {
+        Some(bytes) => {
+            let trimmed = bytes.trim_ascii();
+            if trimmed.is_empty() {
+                return err(ApiError::InvalidIdempotencyKey);
+            }
             if trimmed.len() > 128 {
                 return err(ApiError::InvalidIdempotencyKey);
             }
-            trimmed
+            match std::str::from_utf8(trimmed) {
+                Ok(value) => value.to_string(),
+                Err(_) => return err(ApiError::InvalidIdempotencyKey),
+            }
         }
-        Some(_) => return err(ApiError::InvalidIdempotencyKey),
         None => return err(ApiError::MissingIdempotencyKey),
     };
 
