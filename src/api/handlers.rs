@@ -1,5 +1,5 @@
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde_json::Value;
@@ -50,35 +50,40 @@ pub async fn enqueue(
         None => return err(ApiError::MissingIdempotencyKey),
     };
 
-    let parsed: Value = match serde_json::from_slice(&body) {
+    let mut parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return err(ApiError::InvalidJson),
     };
-    let obj = match parsed.as_object() {
-        Some(obj) => obj,
+    if parsed.as_object().is_none() {
+        return err(ApiError::InvalidTargetUrl);
+    }
+
+    let target_url = match parsed.get("target_url").and_then(|value| value.as_str()) {
+        Some(url) => url.to_string(),
         None => return err(ApiError::InvalidTargetUrl),
     };
-    let url = match obj.get("target_url").and_then(|value| value.as_str()) {
-        Some(url) => url,
-        None => return err(ApiError::InvalidTargetUrl),
-    };
-    let payload = match obj.get("payload") {
-        Some(payload) => payload.clone(),
+
+    let payload = match parsed
+        .as_object_mut()
+        .and_then(|object| object.remove("payload"))
+    {
+        Some(payload) => payload,
         None => return err(ApiError::InvalidPayload),
     };
-    let url = match Url::parse(url) {
+
+    let parsed_url = match Url::parse(&target_url) {
         Ok(url) => url,
         Err(_) => return err(ApiError::InvalidTargetUrl),
     };
-    let scheme_ok = url.scheme() == "http" || url.scheme() == "https";
-    let host_ok = url.host_str().is_some();
+    let scheme_ok = parsed_url.scheme() == "http" || parsed_url.scheme() == "https";
+    let host_ok = parsed_url.host_str().is_some();
     if !scheme_ok || !host_ok {
         return err(ApiError::InvalidTargetUrl);
     }
 
     let outcome = match state
         .enqueue
-        .enqueue(key.as_str(), url.as_str(), payload)
+        .enqueue(key.as_str(), target_url.as_str(), payload)
         .await
     {
         Ok(outcome) => outcome,
@@ -92,15 +97,29 @@ pub async fn enqueue(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct DeliveryId(Uuid);
+
+impl<S> FromRequest<S> for DeliveryId
+where
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, ApiError> {
+        let raw_segment = req.uri().path().split('/').next_back().unwrap_or("");
+        let id = raw_segment
+            .parse::<Uuid>()
+            .map_err(|_| ApiError::DeliveryNotFound)?;
+        Ok(Self(id))
+    }
+}
+
 pub async fn get_delivery(
     State(state): State<AppState>,
-    Path(id_str): Path<String>,
+    id: DeliveryId,
 ) -> (StatusCode, Json<Value>) {
-    let id: Uuid = match id_str.parse() {
-        Ok(id) => id,
-        Err(_) => return err(ApiError::DeliveryNotFound),
-    };
-    match state.query.get(id).await {
+    match state.query.get(id.0).await {
         Ok(Some(delivery)) => (StatusCode::OK, Json(delivery_json(&delivery))),
         Ok(None) => err(ApiError::DeliveryNotFound),
         Err(_) => err(ApiError::Internal),

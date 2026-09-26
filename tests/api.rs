@@ -9,14 +9,14 @@ async fn ready(client: &Client, base: &str) -> bool {
     }
 }
 
-async fn start_from(url: &str) -> (Client, String) {
+async fn start_from(url: &str) -> (Client, String, tokio::task::JoinHandle<()>) {
     let app = relaybox::app::App::create(url).await.unwrap();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0u16))
         .await
         .unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let router = app.router;
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
 
@@ -28,7 +28,7 @@ async fn start_from(url: &str) -> (Client, String) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    (client, base)
+    (client, base, handle)
 }
 
 async fn start() -> (Client, String, String, tempfile::TempDir) {
@@ -36,7 +36,7 @@ async fn start() -> (Client, String, String, tempfile::TempDir) {
     let db_path = dir.path().join("test.db");
     std::fs::write(&db_path, b"").unwrap();
     let url = format!("sqlite://{}", db_path.display());
-    let (client, base) = start_from(&url).await;
+    let (client, base, _) = start_from(&url).await;
     (client, base, url, dir)
 }
 
@@ -150,6 +150,25 @@ async fn new_enqueue_returns_201_with_representation() {
 }
 
 #[tokio::test]
+async fn target_url_stored_verbatim() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "tvk",
+        "https://a.test/webhooks/?b=2&a=1",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let id = body.get("id").unwrap().as_str().unwrap().to_string();
+    let (status2, body2) = get(&client, &base, &format!("/v1/deliveries/{id}")).await;
+    assert_eq!(status2, reqwest::StatusCode::OK);
+    assert_eq!(s(&body2, "target_url"), "https://a.test/webhooks/?b=2&a=1");
+    assert_eq!(value_of(&body2, "payload"), &json!({"a": 1}));
+}
+
+#[tokio::test]
 async fn payload_accepts_various_json_types() {
     let (client, base, _, _) = start().await;
     let payloads = [
@@ -172,6 +191,26 @@ async fn payload_accepts_various_json_types() {
         assert_eq!(status, reqwest::StatusCode::CREATED);
         assert_eq!(value_of(&body, "payload"), p);
     }
+}
+
+#[tokio::test]
+async fn large_integer_payload_round_trips() {
+    let big: u128 = 123456789012345678901234567890;
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "bigk",
+        "https://example.test/webhooks",
+        &json!({"n": big}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    assert_eq!(value_of(&body, "payload"), &json!({"n": big}));
+    let id = body.get("id").unwrap().as_str().unwrap().to_string();
+    let (status2, body2) = get(&client, &base, &format!("/v1/deliveries/{id}")).await;
+    assert_eq!(status2, reqwest::StatusCode::OK);
+    assert_eq!(value_of(&body2, "payload"), &json!({"n": big}));
 }
 
 #[tokio::test]
@@ -214,6 +253,14 @@ async fn get_unknown_returns_404() {
 async fn get_malformed_uuid_returns_404() {
     let (client, base, _, _) = start().await;
     let (status, body) = get(&client, &base, "/v1/deliveries/not-a-uuid").await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body), "delivery_not_found");
+}
+
+#[tokio::test]
+async fn uri_percent_encoded_non_uuid_returns_404() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = get(&client, &base, "/v1/deliveries/%FF").await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
     assert_eq!(error_code(&body), "delivery_not_found");
 }
@@ -375,7 +422,12 @@ async fn concurrent_same_key_single_row() {
 
 #[tokio::test]
 async fn persists_across_restart() {
-    let (client, base, url, _) = start().await;
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    std::fs::write(&db_path, b"").unwrap();
+    let url = format!("sqlite://{}", db_path.display());
+    let (client, base, handle) = start_from(&url).await;
+
     let (status, body) = enqueue(
         &client,
         &base,
@@ -387,7 +439,10 @@ async fn persists_across_restart() {
     assert_eq!(status, reqwest::StatusCode::CREATED);
     let id = body.get("id").unwrap().as_str().unwrap().to_string();
 
-    let (client2, base2) = start_from(&url).await;
+    handle.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let (client2, base2, _) = start_from(&url).await;
     let (status2, body2) = get(&client2, &base2, &format!("/v1/deliveries/{id}")).await;
     assert_eq!(status2, reqwest::StatusCode::OK);
     assert_eq!(s(&body2, "id"), id.as_str());
