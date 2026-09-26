@@ -1,0 +1,518 @@
+use reqwest::Client;
+use serde_json::json;
+use tempfile::tempdir;
+
+async fn ready(client: &Client, base: &str) -> bool {
+    match client.get(format!("{base}/health")).send().await {
+        Ok(resp) => resp.status().as_u16() == 200,
+        Err(_) => false,
+    }
+}
+
+async fn start_from(url: &str) -> (Client, String) {
+    let app = relaybox::app::App::create(url).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0u16))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = app.router;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = Client::new();
+    for _ in 0..300 {
+        if ready(&client, &base).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    (client, base)
+}
+
+async fn start() -> (Client, String, String, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    std::fs::write(&db_path, b"").unwrap();
+    let url = format!("sqlite://{}", db_path.display());
+    let (client, base) = start_from(&url).await;
+    (client, base, url, dir)
+}
+
+fn error_code(body: &serde_json::Value) -> &str {
+    body.get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())
+        .expect("response must contain an error code")
+}
+
+fn s<'a>(body: &'a serde_json::Value, key: &str) -> &'a str {
+    body.get(key).and_then(|v| v.as_str()).expect(key)
+}
+
+fn u64_of(body: &serde_json::Value, key: &str) -> u64 {
+    body.get(key).and_then(|v| v.as_u64()).expect(key)
+}
+
+fn value_of<'a>(body: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+    body.get(key).expect(key)
+}
+
+async fn get(client: &Client, base: &str, path: &str) -> (reqwest::StatusCode, serde_json::Value) {
+    let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+    (status, body)
+}
+
+async fn enqueue(
+    client: &Client,
+    base: &str,
+    key: &str,
+    target_url: &str,
+    payload: &serde_json::Value,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let body = json!({
+        "target_url": target_url,
+        "payload": payload,
+    });
+    let resp = client
+        .post(format!("{base}/v1/deliveries"))
+        .header("idempotency-key", key)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let value: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+    (status, value)
+}
+
+async fn enqueue_raw(
+    client: &Client,
+    base: &str,
+    key: Option<&str>,
+    body: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let resp = match key {
+        Some(k) => {
+            client
+                .post(format!("{base}/v1/deliveries"))
+                .header("idempotency-key", k)
+                .body(body.as_bytes().to_vec())
+                .send()
+                .await
+        }
+        None => {
+            client
+                .post(format!("{base}/v1/deliveries"))
+                .body(body.as_bytes().to_vec())
+                .send()
+                .await
+        }
+    }
+    .unwrap();
+    let status = resp.status();
+    let value: serde_json::Value = resp.json().await.unwrap_or(json!(null));
+    (status, value)
+}
+
+#[tokio::test]
+async fn health_returns_ok() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = get(&client, &base, "/health").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body.get("status").unwrap(), &json!("ok"));
+}
+
+#[tokio::test]
+async fn new_enqueue_returns_201_with_representation() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "rk",
+        "https://example.test/webhooks",
+        &json!({"event": "invoice.created", "invoice_id": "inv_123"}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    assert!(body.get("id").is_some());
+    assert_eq!(s(&body, "status"), "pending");
+    assert_eq!(u64_of(&body, "attempts"), 0);
+    assert_eq!(s(&body, "target_url"), "https://example.test/webhooks");
+    assert_eq!(
+        value_of(&body, "payload"),
+        &json!({"event": "invoice.created", "invoice_id": "inv_123"})
+    );
+    assert!(body.get("created_at").is_some());
+}
+
+#[tokio::test]
+async fn payload_accepts_various_json_types() {
+    let (client, base, _, _) = start().await;
+    let payloads = [
+        json!("hello"),
+        json!(42),
+        json!(true),
+        json!(null),
+        json!([1, 2, 3]),
+        json!({"nested": {"x": 1}}),
+    ];
+    for (i, p) in payloads.iter().enumerate() {
+        let (status, body) = enqueue(
+            &client,
+            &base,
+            &format!("pk{i}"),
+            "https://example.test/webhooks",
+            p,
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::CREATED);
+        assert_eq!(value_of(&body, "payload"), p);
+    }
+}
+
+#[tokio::test]
+async fn get_existing_returns_200_and_fields() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "gk",
+        "https://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let id = body.get("id").unwrap().as_str().unwrap().to_string();
+    let (status2, body2) = get(&client, &base, &format!("/v1/deliveries/{id}")).await;
+    assert_eq!(status2, reqwest::StatusCode::OK);
+    assert_eq!(s(&body2, "id"), id.as_str());
+    assert_eq!(s(&body2, "status"), "pending");
+    assert_eq!(u64_of(&body2, "attempts"), 0);
+    assert_eq!(s(&body2, "target_url"), "https://example.test/webhooks");
+    assert_eq!(value_of(&body2, "payload"), &json!({"a": 1}));
+    assert!(body2.get("created_at").is_some());
+}
+
+#[tokio::test]
+async fn get_unknown_returns_404() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = get(
+        &client,
+        &base,
+        "/v1/deliveries/00000000-0000-0000-0000-000000000000",
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body), "delivery_not_found");
+}
+
+#[tokio::test]
+async fn get_malformed_uuid_returns_404() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = get(&client, &base, "/v1/deliveries/not-a-uuid").await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(error_code(&body), "delivery_not_found");
+}
+
+#[tokio::test]
+async fn replay_same_content_returns_200_same_id() {
+    let (client, base, _, _) = start().await;
+    let (s1, b1) = enqueue(
+        &client,
+        &base,
+        "rk",
+        "https://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED);
+    let id1 = b1.get("id").unwrap().as_str().unwrap().to_string();
+    let (s2, b2) = enqueue(
+        &client,
+        &base,
+        "rk",
+        "https://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(s2, reqwest::StatusCode::OK);
+    assert_eq!(s(&b2, "id"), id1.as_str());
+}
+
+#[tokio::test]
+async fn replay_payload_key_order_insensitive() {
+    let (client, base, _, _) = start().await;
+    let (s1, b1) = enqueue(
+        &client,
+        &base,
+        "rk",
+        "https://example.test/webhooks",
+        &json!({"a": 1, "b": 2}),
+    )
+    .await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED);
+    let id1 = b1.get("id").unwrap().as_str().unwrap().to_string();
+    let (s2, b2) = enqueue(
+        &client,
+        &base,
+        "rk",
+        "https://example.test/webhooks",
+        &json!({"b": 2, "a": 1}),
+    )
+    .await;
+    assert_eq!(s2, reqwest::StatusCode::OK);
+    assert_eq!(s(&b2, "id"), id1.as_str());
+}
+
+#[tokio::test]
+async fn conflict_different_url_returns_409() {
+    let (client, base, _, _) = start().await;
+    enqueue(
+        &client,
+        &base,
+        "ck",
+        "https://a.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "ck",
+        "https://b.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    assert_eq!(error_code(&body), "idempotency_conflict");
+}
+
+#[tokio::test]
+async fn conflict_different_payload_returns_409() {
+    let (client, base, _, _) = start().await;
+    enqueue(
+        &client,
+        &base,
+        "ck",
+        "https://a.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "ck",
+        "https://a.test/webhooks",
+        &json!({"a": 2}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT);
+    assert_eq!(error_code(&body), "idempotency_conflict");
+}
+
+#[tokio::test]
+async fn conflict_leaves_original_unchanged() {
+    let (client, base, _, _) = start().await;
+    let (s1, b1) = enqueue(
+        &client,
+        &base,
+        "ck",
+        "https://a.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(s1, reqwest::StatusCode::CREATED);
+    let id = b1.get("id").unwrap().as_str().unwrap().to_string();
+    enqueue(
+        &client,
+        &base,
+        "ck",
+        "https://b.test/webhooks",
+        &json!({"a": 9}),
+    )
+    .await;
+    let (status2, body2) = get(&client, &base, &format!("/v1/deliveries/{id}")).await;
+    assert_eq!(status2, reqwest::StatusCode::OK);
+    assert_eq!(s(&body2, "target_url"), "https://a.test/webhooks");
+    assert_eq!(value_of(&body2, "payload"), &json!({"a": 1}));
+}
+
+#[tokio::test]
+async fn concurrent_same_key_single_row() {
+    let (client, base, db_url, _) = start().await;
+    let key = "concurrent-key";
+    let url = "https://example.test/webhooks";
+    let payload = json!({"event": "x"});
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let client = client.clone();
+        let base = base.clone();
+        let key = key.to_string();
+        let url = url.to_string();
+        let payload = payload.clone();
+        let _ = i;
+        handles.push(tokio::spawn(async move {
+            enqueue(&client, &base, &key, &url, &payload).await
+        }));
+    }
+    for h in handles {
+        let (status, _) = h.await.unwrap();
+        assert!(status == reqwest::StatusCode::OK || status == reqwest::StatusCode::CREATED);
+    }
+    let pool = relaybox::infrastructure::sqlite::open_pool(&db_url)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) AS n FROM deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn persists_across_restart() {
+    let (client, base, url, _) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "restart-key",
+        "https://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let id = body.get("id").unwrap().as_str().unwrap().to_string();
+
+    let (client2, base2) = start_from(&url).await;
+    let (status2, body2) = get(&client2, &base2, &format!("/v1/deliveries/{id}")).await;
+    assert_eq!(status2, reqwest::StatusCode::OK);
+    assert_eq!(s(&body2, "id"), id.as_str());
+}
+
+#[tokio::test]
+async fn missing_idempotency_key_returns_400() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue_raw(
+        &client,
+        &base,
+        None,
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "missing_idempotency_key");
+}
+
+#[tokio::test]
+async fn empty_idempotency_key_returns_400() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue_raw(
+        &client,
+        &base,
+        Some(""),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_idempotency_key");
+}
+
+#[tokio::test]
+async fn whitespace_idempotency_key_returns_400() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue_raw(
+        &client,
+        &base,
+        Some("   "),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_idempotency_key");
+}
+
+#[tokio::test]
+async fn long_idempotency_key_returns_400() {
+    let (client, base, _, _) = start().await;
+    let long = "a".repeat(129);
+    let (status, body) = enqueue_raw(
+        &client,
+        &base,
+        Some(&long),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_idempotency_key");
+}
+
+#[tokio::test]
+async fn boundary_idempotency_key_of_128_bytes_is_accepted() {
+    let (client, base, _, _) = start().await;
+    let key = "a".repeat(128);
+    let (status, _) = enqueue_raw(
+        &client,
+        &base,
+        Some(&key),
+        r#"{"target_url":"https://example.test/webhooks","payload":{"a":1}}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn malformed_json_returns_400() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue_raw(&client, &base, Some("k"), r#"{not json"#).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(&body), "invalid_json");
+}
+
+#[tokio::test]
+async fn invalid_target_url_returns_422() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "k",
+        "ftp://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "invalid_target_url");
+}
+
+#[tokio::test]
+async fn target_url_no_host_returns_422() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue(&client, &base, "k", "http://", &json!({"a": 1})).await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "invalid_target_url");
+}
+
+#[tokio::test]
+async fn missing_target_url_returns_422() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue_raw(&client, &base, Some("k"), r#"{"payload":{"a":1}}"#).await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "invalid_target_url");
+}
+
+#[tokio::test]
+async fn missing_payload_returns_422() {
+    let (client, base, _, _) = start().await;
+    let (status, body) = enqueue_raw(
+        &client,
+        &base,
+        Some("k"),
+        r#"{"target_url":"https://example.test/webhooks"}"#,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(&body), "invalid_payload");
+}

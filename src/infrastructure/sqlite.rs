@@ -89,11 +89,11 @@ fn row_to_delivery(row: &SqliteRow) -> Result<Delivery, RepositoryError> {
 /// or payload), which the spec rejects with `409 idempotency_conflict`.
 fn is_conflict_row(row: &SqliteRow, target_url: &str, payload: &Value) -> bool {
     if row.get::<String, _>("target_url") != target_url {
-        return false;
+        return true;
     }
     match serde_json::from_str::<Value>(&row.get::<String, _>("payload")) {
-        Ok(v) => v == *payload,
-        Err(_) => false,
+        Ok(v) => v != *payload,
+        Err(_) => true,
     }
 }
 
