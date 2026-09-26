@@ -76,6 +76,39 @@ fn err(e: ApiError) -> (StatusCode, Json<Value>) {
     (status, Json(body))
 }
 
+fn has_nonempty_host(raw: &str) -> bool {
+    let rest = match raw.find("://") {
+        Some(i) => &raw[i + 3..],
+        None => return false,
+    };
+    let mut authority_end = rest.len();
+    for c in ['/', '?', '#'] {
+        if let Some(i) = rest.find(c) {
+            authority_end = authority_end.min(i);
+        }
+    }
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return false;
+    }
+    let host_and_port = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    let host = if host_and_port.starts_with('[') {
+        match host_and_port.find(']') {
+            Some(i) => &host_and_port[..i],
+            None => return false,
+        }
+    } else {
+        match host_and_port.find(':') {
+            Some(i) => &host_and_port[..i],
+            None => host_and_port,
+        }
+    };
+    !host.is_empty()
+}
+
 pub async fn enqueue(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -123,7 +156,7 @@ pub async fn enqueue(
         Err(_) => return err(ApiError::InvalidTargetUrl),
     };
     let scheme_ok = parsed_url.scheme() == "http" || parsed_url.scheme() == "https";
-    let host_ok = parsed_url.host_str().is_some();
+    let host_ok = has_nonempty_host(&target_url);
     if !scheme_ok || !host_ok {
         return err(ApiError::InvalidTargetUrl);
     }

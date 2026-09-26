@@ -709,6 +709,30 @@ async fn target_url_no_host_returns_422() {
 }
 
 #[tokio::test]
+async fn target_url_without_nonempty_host_returns_422() {
+    let (client, base, _, dir) = start().await;
+    let invalid_urls = [
+        "http:///path",
+        "https:///path",
+        "http:example.com",
+        "http:/example.com",
+        "http://@/",
+        "http://:8080/",
+    ];
+    for (i, url) in invalid_urls.iter().enumerate() {
+        let (status, body) =
+            enqueue(&client, &base, &format!("mh{i}"), url, &json!({"a": 1})).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "url {url:?}"
+        );
+        assert_eq!(error_code(&body), "invalid_target_url", "url {url:?}");
+    }
+    drop(dir);
+}
+
+#[tokio::test]
 async fn missing_target_url_returns_422() {
     let (client, base, _, _) = start().await;
     let (status, body) = enqueue_raw(&client, &base, Some("k"), r#"{"payload":{"a":1}}"#).await;
