@@ -34,7 +34,6 @@ async fn start_from(url: &str) -> (Client, String, tokio::task::JoinHandle<()>) 
 async fn start() -> (Client, String, String, tempfile::TempDir) {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    std::fs::write(&db_path, b"").unwrap();
     let url = format!("sqlite://{}", db_path.display());
     let (client, base, _) = start_from(&url).await;
     (client, base, url, dir)
@@ -157,6 +156,39 @@ async fn health_returns_ok() {
     let (status, body) = get(&client, &base, "/health").await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body.get("status").unwrap(), &json!("ok"));
+}
+
+#[tokio::test]
+async fn starts_healthy_when_database_file_does_not_exist() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("missing.db");
+    let url = format!("sqlite://{}", db_path.display());
+
+    // The database file must genuinely be absent before startup, matching a
+    // fresh install where no `.db` file exists yet.
+    assert!(!db_path.exists());
+
+    let (client, base, handle) = start_from(&url).await;
+    assert!(db_path.exists());
+
+    let (status, body) = get(&client, &base, "/health").await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body.get("status").unwrap(), &json!("ok"));
+
+    // Migrations must have run against the newly created database.
+    let (status, body) = enqueue(
+        &client,
+        &base,
+        "missing-k",
+        "https://example.test/webhooks",
+        &json!({"a": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    assert!(body.get("id").is_some());
+
+    handle.abort();
+    drop(dir);
 }
 
 #[tokio::test]
@@ -468,7 +500,6 @@ async fn concurrent_same_key_single_row() {
 async fn persists_across_restart() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    std::fs::write(&db_path, b"").unwrap();
     let url = format!("sqlite://{}", db_path.display());
     let (client, base, handle) = start_from(&url).await;
 
